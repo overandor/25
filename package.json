@@ -1,0 +1,19 @@
+{
+  "name": "ip-prime-brokerage",
+  "private": true,
+  "workspaces": [
+    "apps/*",
+    "packages/*",
+    "services/*"
+  ],
+  "scripts": {
+    "build": "turbo run build",
+    "dev": "turbo run dev",
+    "lint": "turbo run lint",
+    "format": "prettier --write \\"**/*.{ts,tsx,md}\\""
+  },
+  "devDependencies": {
+    "prettier": "^2.8.8",
+    "turbo": "latest"
+  }
+}
