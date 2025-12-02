@@ -1,0 +1,9 @@
+node_modules
+smart-contracts/node_modules
+smart-contracts/artifacts
+smart-contracts/cache
+smart-contracts/typechain-types
+.env
+audit_logs/
+backup/
+backups/

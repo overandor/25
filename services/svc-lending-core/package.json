@@ -1,0 +1,18 @@
+{
+  "name": "svc-lending-core",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "main": "src/index.js",
+  "scripts": {
+    "start": "node src/index.js",
+    "dev": "node src/index.js",
+    "lint": "node --check src/*.js",
+    "test": "node --test"
+  },
+  "dependencies": {
+    "@ip-prime-brokerage/pkg-types": "^0.1.0",
+    "@ip-prime-brokerage/pkg-utils": "^0.1.0",
+    "uuid": "^9.0.1"
+  }
+}

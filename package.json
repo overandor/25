@@ -1,0 +1,22 @@
+{
+  "name": "ip-prime-brokerage",
+  "private": true,
+  "version": "0.1.0",
+  "description": "Fintech-as-a-Service monorepo for IP collateralization",
+  "license": "MIT",
+  "workspaces": [
+    "apps/*",
+    "packages/*",
+    "services/*",
+    "smart-contracts"
+  ],
+  "scripts": {
+    "dev": "turbo run dev",
+    "build": "turbo run build",
+    "lint": "turbo run lint",
+    "test": "turbo run test"
+  },
+  "devDependencies": {
+    "turbo": "^1.13.3"
+  }
+}

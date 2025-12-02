@@ -1,0 +1,21 @@
+{
+  "name": "@ip-prime-brokerage/pkg-utils",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "main": "src/index.js",
+  "exports": {
+    ".": "./src/index.js"
+  },
+  "license": "MIT",
+  "dependencies": {
+    "dotenv": "^16.4.5",
+    "fastify": "^4.26.2",
+    "pino": "^8.17.2",
+    "zod": "^3.23.8"
+  },
+  "scripts": {
+    "lint": "node --check src/*.js",
+    "test": "node --test"
+  }
+}
