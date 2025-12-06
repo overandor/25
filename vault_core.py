@@ -420,32 +420,36 @@ class JsonStore:
         self.base_path.mkdir(parents=True, exist_ok=True)
         self._lock = asyncio.Lock()
 
-    async def _load(self, file_name: str) -> List[Dict[str, Any]]:
+    async def _load_locked(self, file_name: str) -> List[Dict[str, Any]]:
         path = self.base_path / file_name
         if not path.exists():
             return []
-        async with self._lock:
-            loop = asyncio.get_running_loop()
-            content = await loop.run_in_executor(None, path.read_text)
-            try:
-                return json.loads(content)
-            except json.JSONDecodeError:
-                return []
+        loop = asyncio.get_running_loop()
+        content = await loop.run_in_executor(None, path.read_text)
+        try:
+            return json.loads(content)
+        except json.JSONDecodeError:
+            return []
 
-    async def _write(self, file_name: str, data: List[Dict[str, Any]]):
+    async def _write_locked(self, file_name: str, data: List[Dict[str, Any]]):
         path = self.base_path / file_name
         encoded = jsonable_encoder(data)
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(None, lambda: path.write_text(json.dumps(encoded, indent=2)))
+
+    async def load(self, file_name: str) -> List[Dict[str, Any]]:
         async with self._lock:
-            loop = asyncio.get_running_loop()
-            await loop.run_in_executor(None, lambda: path.write_text(json.dumps(encoded, indent=2)))
+            return await self._load_locked(file_name)
 
     async def append(self, file_name: str, record: Dict[str, Any]):
-        records = await self._load(file_name)
-        records.append(record)
-        await self._write(file_name, records)
+        async with self._lock:
+            records = await self._load_locked(file_name)
+            records.append(record)
+            await self._write_locked(file_name, records)
 
     async def replace(self, file_name: str, updated_records: List[Dict[str, Any]]):
-        await self._write(file_name, updated_records)
+        async with self._lock:
+            await self._write_locked(file_name, updated_records)
 
 
 class LiquidityRoute(BaseModel):
@@ -652,11 +656,11 @@ class LiquidityExecutionService:
         await self.store.append(self._receipt_file, receipt.dict())
 
     async def get_intents(self) -> List[LiquidityIntent]:
-        intents = await self.store._load(self._intent_file)
+        intents = await self.store.load(self._intent_file)
         return [LiquidityIntent(**i) for i in intents]
 
     async def update_intent_status(self, intent_id: str, status_value: str):
-        intents = await self.store._load(self._intent_file)
+        intents = await self.store.load(self._intent_file)
         updated = []
         for item in intents:
             if item.get("intent_id") == intent_id:
