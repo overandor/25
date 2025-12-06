@@ -12,9 +12,10 @@ import time
 from contextlib import asynccontextmanager
 from typing import Any, AsyncGenerator, Dict, List, Optional
 import hashlib
+from pathlib import Path
 
 import redis.asyncio as redis
-from fastapi import FastAPI, HTTPException, BackgroundTasks, Request, status
+from fastapi import FastAPI, HTTPException, BackgroundTasks, Request, status, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, BaseSettings, Field, validator, condecimal
@@ -476,6 +477,18 @@ app.add_middleware(
 rate_limit_middleware = RateLimitMiddleware(security_config.RATE_LIMIT_REDIS_URL)
 app.middleware("http")(rate_limit_middleware)
 
+# ===== ARTIFACT INGESTION SETTINGS =====
+ALLOWED_CONTENT_TYPES = {
+    "application/pdf",
+    "application/zip",
+    "application/json",
+    "image/png",
+    "image/jpeg",
+    "text/plain",
+}
+MAX_UPLOAD_SIZE_BYTES = 10 * 1024 * 1024  # 10 MB
+ARTIFACTS_DIR = Path("artifacts")
+
 # ===== API MODELS =====
 class VaultCreationRequest(BaseModel):
     ip_hash: str = Field(..., regex="^0x[a-fA-F0-9]{64}$")
@@ -491,6 +504,61 @@ class VaultCreationRequest(BaseModel):
 
 class ComplianceCheckRequest(BaseModel):
     wallet_address: str = Field(..., regex="^0x[a-fA-F0-9]{40}$")
+
+
+async def store_artifact_and_hash(upload: UploadFile) -> Dict[str, Any]:
+    """Persist upload to disk, enforce limits, and return deterministic hash."""
+    content_type = upload.content_type or ""
+    if content_type not in ALLOWED_CONTENT_TYPES:
+        raise HTTPException(
+            status_code=status.HTTP_415_UNSUPPORTED_MEDIA_TYPE,
+            detail="Unsupported content type",
+        )
+
+    if not upload.filename:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Filename is required",
+        )
+
+    ARTIFACTS_DIR.mkdir(parents=True, exist_ok=True)
+
+    sanitized_name = Path(upload.filename).name
+    temp_path = ARTIFACTS_DIR / f"temp_{int(time.time() * 1000)}_{sanitized_name}"
+    hasher = hashlib.sha3_256()
+    size = 0
+
+    try:
+        with temp_path.open("wb") as buffer:
+            while True:
+                chunk = await upload.read(1024 * 1024)
+                if not chunk:
+                    break
+
+                size += len(chunk)
+                if size > MAX_UPLOAD_SIZE_BYTES:
+                    raise HTTPException(
+                        status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+                        detail=f"Upload exceeds {MAX_UPLOAD_SIZE_BYTES // (1024 * 1024)}MB limit",
+                    )
+
+                buffer.write(chunk)
+                hasher.update(chunk)
+    except HTTPException:
+        if temp_path.exists():
+            temp_path.unlink()
+        raise
+
+    ip_hash = "0x" + hasher.hexdigest()
+    final_path = ARTIFACTS_DIR / f"{ip_hash[2:]}_{sanitized_name}"
+    temp_path.replace(final_path)
+
+    return {
+        "ip_hash": ip_hash,
+        "size_bytes": size,
+        "stored_as": final_path.name,
+        "content_type": content_type,
+    }
 
 # ===== API ENDPOINTS =====
 @app.get("/health")
@@ -514,6 +582,25 @@ async def health_check():
         },
         "version": "1.0.0"
     }
+
+
+@app.post("/vault/upload")
+async def upload_artifact(request: Request, file: UploadFile = File(...)):
+    """Upload collateral artifacts, enforce safety limits, and return deterministic hash."""
+    artifact = await store_artifact_and_hash(file)
+
+    audit_logger.log_event(
+        "artifact_uploaded",
+        request.client.host if request.client else "unknown",
+        {
+            "filename": file.filename,
+            "size_bytes": artifact["size_bytes"],
+            "content_type": artifact["content_type"],
+            "ip_hash": artifact["ip_hash"],
+        },
+    )
+
+    return artifact
 
 @app.post("/vault/create")
 async def create_vault(request: VaultCreationRequest, background_tasks: BackgroundTasks):
