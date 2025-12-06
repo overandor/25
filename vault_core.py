@@ -9,9 +9,12 @@ import json
 import logging
 import os
 import time
+import uuid
 from contextlib import asynccontextmanager
 from typing import Any, AsyncGenerator, Dict, List, Optional
 import hashlib
+from decimal import Decimal, ROUND_DOWN
+from pathlib import Path
 
 import redis.asyncio as redis
 from fastapi import FastAPI, HTTPException, BackgroundTasks, Request, status
@@ -23,6 +26,7 @@ from web3.eth import AsyncEth
 from web3.middleware import async_geth_poa_middleware
 from web3.exceptions import ContractLogicError, TransactionNotFound
 from cryptography.fernet import Fernet
+from fastapi.encoders import jsonable_encoder
 
 # ===== APPLICATION SETTINGS =====
 class AppSettings(BaseSettings):
@@ -39,6 +43,7 @@ class AppSettings(BaseSettings):
     encrypted_private_key: Optional[str] = Field(None, env="ENCRYPTED_PRIVATE_KEY")
     redis_url: str = Field("redis://localhost:6379", env="REDIS_URL")
     allowed_origins: List[str] = Field(default_factory=list, env="ALLOWED_ORIGINS")
+    liquidity_store_path: str = Field("data/liquidity", env="LIQUIDITY_STORE_PATH")
 
     class Config:
         env_file = ".env"
@@ -76,6 +81,7 @@ class SecurityConfig:
             raise ValueError("ENCRYPTION_KEY is required for decrypting signing keys")
 
         self.cipher = Fernet(self.ENCRYPTION_KEY.encode())
+        self._decrypted_signer: Optional[str] = None
     
     def encrypt_sensitive(self, data: str) -> str:
         """Encrypt sensitive data like private keys"""
@@ -84,6 +90,18 @@ class SecurityConfig:
     def decrypt_sensitive(self, encrypted_data: str) -> str:
         """Decrypt sensitive data"""
         return self.cipher.decrypt(encrypted_data.encode()).decode()
+
+    def signer_key(self, encrypted_private_key: Optional[str]) -> str:
+        if self._decrypted_signer:
+            return self._decrypted_signer
+
+        if not encrypted_private_key:
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="ENCRYPTED_PRIVATE_KEY is required for signing liquidity transactions",
+            )
+        self._decrypted_signer = self.decrypt_sensitive(encrypted_private_key)
+        return self._decrypted_signer
 
 # ===== BLOCKCHAIN SERVICE =====
 class AsyncBlockchainService:
@@ -394,6 +412,278 @@ class RateLimitMiddleware:
         
         return await call_next(request)
 
+class JsonStore:
+    """Minimal persistent store for liquidity intents and receipts"""
+
+    def __init__(self, base_path: str):
+        self.base_path = Path(base_path)
+        self.base_path.mkdir(parents=True, exist_ok=True)
+        self._lock = asyncio.Lock()
+
+    async def _load(self, file_name: str) -> List[Dict[str, Any]]:
+        path = self.base_path / file_name
+        if not path.exists():
+            return []
+        async with self._lock:
+            loop = asyncio.get_running_loop()
+            content = await loop.run_in_executor(None, path.read_text)
+            try:
+                return json.loads(content)
+            except json.JSONDecodeError:
+                return []
+
+    async def _write(self, file_name: str, data: List[Dict[str, Any]]):
+        path = self.base_path / file_name
+        encoded = jsonable_encoder(data)
+        async with self._lock:
+            loop = asyncio.get_running_loop()
+            await loop.run_in_executor(None, lambda: path.write_text(json.dumps(encoded, indent=2)))
+
+    async def append(self, file_name: str, record: Dict[str, Any]):
+        records = await self._load(file_name)
+        records.append(record)
+        await self._write(file_name, records)
+
+    async def replace(self, file_name: str, updated_records: List[Dict[str, Any]]):
+        await self._write(file_name, updated_records)
+
+
+class LiquidityRoute(BaseModel):
+    route_id: str
+    route_type: str
+    provider: str
+    expected_output: Decimal
+    min_output: Decimal
+    slippage_bps: int
+    gas_estimate: int
+    gas_cap: int
+    fee_cap_usd: Decimal
+    execution_target: str
+    notes: Optional[str] = None
+
+
+class LiquidityIntent(BaseModel):
+    intent_id: str
+    vault_id: str
+    target_chain: str
+    source_token: str
+    destination_token: str
+    amount: Decimal
+    slippage_bps: int
+    gas_cap_wei: int
+    fee_cap_usd: Decimal
+    routes: List[LiquidityRoute]
+    status: str
+    created_at: float
+
+
+class LiquidityReceipt(BaseModel):
+    receipt_id: str
+    intent_id: str
+    route_id: str
+    tx_hash: Optional[str]
+    status: str
+    chain: str
+    gas_used: Optional[int]
+    fee_paid_wei: Optional[int]
+    timestamp: float
+    detail: Optional[Dict[str, Any]] = None
+
+
+class LiquidityQuoteRequest(BaseModel):
+    vault_id: str
+    target_chain: str
+    source_token: str
+    destination_token: str
+    amount: condecimal(gt=0, max_digits=30, decimal_places=8)
+    slippage_bps: int = Field(50, ge=0, le=1000)
+    gas_cap_wei: int = Field(5_000_000, gt=0)
+    fee_cap_usd: condecimal(gt=0, max_digits=20, decimal_places=2) = Field(...)
+
+    @validator("target_chain", "vault_id", "source_token", "destination_token")
+    def non_empty(cls, v: str) -> str:
+        if not v.strip():
+            raise ValueError("value must not be empty")
+        return v
+
+
+class LiquidityExecuteRequest(BaseModel):
+    intent_id: str
+    route_id: str
+    receiver: Optional[str] = None
+
+    @validator("receiver")
+    def validate_receiver(cls, v):
+        if v and not Web3.is_address(v):
+            raise ValueError("receiver must be a valid address")
+        return Web3.to_checksum_address(v) if v else v
+
+
+class LiquidityQuoter:
+    """Deterministic quoter for bridge and DEX paths with caps"""
+
+    def __init__(self, default_execution_target: str):
+        self.default_execution_target = default_execution_target
+
+    def quote(self, request: LiquidityQuoteRequest) -> LiquidityIntent:
+        amount = Decimal(request.amount)
+        slippage = Decimal(request.slippage_bps) / Decimal(10_000)
+        min_output = (amount * (Decimal(1) - slippage)).quantize(Decimal("0.00000001"), rounding=ROUND_DOWN)
+
+        bridge_output = (amount * Decimal("0.995")).quantize(Decimal("0.00000001"), rounding=ROUND_DOWN)
+        dex_output = (amount * Decimal("0.998")).quantize(Decimal("0.00000001"), rounding=ROUND_DOWN)
+
+        routes = [
+            LiquidityRoute(
+                route_id=str(uuid.uuid4()),
+                route_type="bridge",
+                provider=f"{request.target_chain}-bridge",
+                expected_output=bridge_output,
+                min_output=min_output,
+                slippage_bps=request.slippage_bps,
+                gas_estimate=min(request.gas_cap_wei, 350_000),
+                gas_cap=request.gas_cap_wei,
+                fee_cap_usd=Decimal(request.fee_cap_usd),
+                execution_target=self.default_execution_target,
+                notes="Includes bridge fee cushion",
+            ),
+            LiquidityRoute(
+                route_id=str(uuid.uuid4()),
+                route_type="dex",
+                provider=f"{request.target_chain}-dex-split",
+                expected_output=dex_output,
+                min_output=min_output,
+                slippage_bps=request.slippage_bps,
+                gas_estimate=min(request.gas_cap_wei, 220_000),
+                gas_cap=request.gas_cap_wei,
+                fee_cap_usd=Decimal(request.fee_cap_usd),
+                execution_target=self.default_execution_target,
+                notes="Dual-path AMM and aggregator mix",
+            ),
+        ]
+
+        intent = LiquidityIntent(
+            intent_id=str(uuid.uuid4()),
+            vault_id=request.vault_id,
+            target_chain=request.target_chain,
+            source_token=request.source_token,
+            destination_token=request.destination_token,
+            amount=amount,
+            slippage_bps=request.slippage_bps,
+            gas_cap_wei=request.gas_cap_wei,
+            fee_cap_usd=Decimal(request.fee_cap_usd),
+            routes=routes,
+            status="quoted",
+            created_at=time.time(),
+        )
+        return intent
+
+
+class LiquidityAdapter:
+    """Base liquidity execution adapter"""
+
+    def __init__(self, blockchain: AsyncBlockchainService, security: SecurityConfig, encrypted_key: Optional[str]):
+        self.blockchain = blockchain
+        self.security = security
+        self.private_key = security.signer_key(encrypted_key)
+        self.account = blockchain.w3.eth.account.from_key(self.private_key)
+
+    async def submit(self, route: LiquidityRoute, receiver: Optional[str] = None) -> LiquidityReceipt:
+        target = receiver or route.execution_target or self.account.address
+        if not Web3.is_address(target):
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Execution target is not a valid address")
+
+        txn = {
+            "from": self.account.address,
+            "to": Web3.to_checksum_address(target),
+            "value": 0,
+            "chainId": self.blockchain.chain_id,
+            "nonce": await self.blockchain.get_nonce(self.account.address),
+            "gasPrice": min(await self.blockchain.get_optimal_gas_price(), route.gas_cap),
+        }
+
+        txn["gas"] = min(route.gas_cap, await self.blockchain.estimate_gas_with_fallback(txn))
+
+        signed_txn = self.blockchain.w3.eth.account.sign_transaction(txn, self.private_key)
+        tx_hash = await self.blockchain.w3.eth.send_raw_transaction(signed_txn.rawTransaction)
+
+        receipt = None
+        for attempt in range(6):
+            try:
+                receipt = await self.blockchain.w3.eth.get_transaction_receipt(tx_hash)
+                if receipt:
+                    break
+            except TransactionNotFound:
+                pass
+            await asyncio.sleep(2 ** attempt)
+
+        return LiquidityReceipt(
+            receipt_id=str(uuid.uuid4()),
+            intent_id="",
+            route_id=route.route_id,
+            tx_hash=tx_hash.hex(),
+            status="confirmed" if receipt and receipt.status == 1 else "failed",
+            chain=str(self.blockchain.chain_id),
+            gas_used=receipt.gasUsed if receipt else None,
+            fee_paid_wei=(receipt.gasUsed * txn["gasPrice"]) if receipt else None,
+            timestamp=time.time(),
+            detail={
+                "blockNumber": receipt.blockNumber if receipt else None,
+                "effectiveGasPrice": getattr(receipt, "effectiveGasPrice", None),
+            },
+        )
+
+
+class LiquidityExecutionService:
+    """Executes intents using chain-specific adapters and persists receipts"""
+
+    def __init__(self, blockchain: AsyncBlockchainService, security: SecurityConfig, store: JsonStore, encrypted_key: Optional[str]):
+        self.blockchain = blockchain
+        self.security = security
+        self.store = store
+        self.adapter = LiquidityAdapter(blockchain, security, encrypted_key)
+        self._intent_file = "intents.json"
+        self._receipt_file = "receipts.json"
+
+    async def save_intent(self, intent: LiquidityIntent):
+        await self.store.append(self._intent_file, intent.dict())
+
+    async def save_receipt(self, receipt: LiquidityReceipt):
+        await self.store.append(self._receipt_file, receipt.dict())
+
+    async def get_intents(self) -> List[LiquidityIntent]:
+        intents = await self.store._load(self._intent_file)
+        return [LiquidityIntent(**i) for i in intents]
+
+    async def update_intent_status(self, intent_id: str, status_value: str):
+        intents = await self.store._load(self._intent_file)
+        updated = []
+        for item in intents:
+            if item.get("intent_id") == intent_id:
+                item["status"] = status_value
+            updated.append(item)
+        await self.store.replace(self._intent_file, updated)
+
+    async def execute(self, request: LiquidityExecuteRequest) -> LiquidityReceipt:
+        intents = await self.get_intents()
+        intent = next((i for i in intents if i.intent_id == request.intent_id), None)
+        if not intent:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Intent not found")
+
+        if intent.status not in {"quoted", "pending"}:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Intent already finalized")
+
+        route = next((r for r in intent.routes if r.route_id == request.route_id), None)
+        if not route:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Route not found for intent")
+
+        await self.update_intent_status(intent.intent_id, "pending")
+        receipt = await self.adapter.submit(route, receiver=request.receiver)
+        receipt.intent_id = intent.intent_id
+        await self.update_intent_status(intent.intent_id, receipt.status)
+        await self.save_receipt(receipt)
+        return receipt
+
 class AuditLogger:
     """Enterprise audit logging with cryptographic integrity"""
     
@@ -440,6 +730,11 @@ settings = AppSettings()
 security_config = SecurityConfig(settings)
 blockchain_service = AsyncBlockchainService(settings.rpc_url)
 audit_logger = AuditLogger()
+store = JsonStore(settings.liquidity_store_path)
+quoter = LiquidityQuoter(default_execution_target=settings.vault_contract or "0x0000000000000000000000000000000000000000")
+liquidity_executor = LiquidityExecutionService(
+    blockchain_service, security_config, store, settings.encrypted_private_key
+)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
@@ -589,8 +884,46 @@ async def verify_compliance(request: ComplianceCheckRequest):
         request.wallet_address,
         {"kyc_verified": result["kyc_verified"]}
     )
-    
+
     return result
+
+
+@app.post("/liquidity/quote")
+async def quote_liquidity(request: LiquidityQuoteRequest):
+    """Return bridge/DEX routes with per-route slippage and caps and persist intent"""
+    intent = quoter.quote(request)
+    await liquidity_executor.save_intent(intent)
+
+    audit_logger.log_event(
+        "liquidity_quote",
+        request.vault_id,
+        {
+            "intent_id": intent.intent_id,
+            "target_chain": request.target_chain,
+            "routes": [r.route_id for r in intent.routes],
+            "gas_cap_wei": request.gas_cap_wei,
+            "fee_cap_usd": str(request.fee_cap_usd),
+        },
+    )
+    return intent
+
+
+@app.post("/liquidity/execute")
+async def execute_liquidity(request: LiquidityExecuteRequest):
+    """Execute a previously quoted route through the chain adapter and persist receipt"""
+    receipt = await liquidity_executor.execute(request)
+
+    audit_logger.log_event(
+        "liquidity_execute",
+        request.intent_id,
+        {
+            "route_id": request.route_id,
+            "receipt_id": receipt.receipt_id,
+            "tx_hash": receipt.tx_hash,
+            "status": receipt.status,
+        },
+    )
+    return receipt
 
 if __name__ == "__main__":
     import uvicorn
