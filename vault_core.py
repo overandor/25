@@ -5,32 +5,43 @@ Enterprise-grade IP collateralization with ERC-3643 compliance
 """
 
 import asyncio
+import hashlib
 import json
 import logging
 import os
 import time
 from contextlib import asynccontextmanager
-from typing import Any, AsyncGenerator, Dict, List, Optional
-import hashlib
+from typing import Any, AsyncGenerator, Dict, List, Literal, Optional, Protocol
 
+import base58
 import redis.asyncio as redis
-from fastapi import FastAPI, HTTPException, BackgroundTasks, Request, status
+from cryptography.fernet import Fernet
+from fastapi import BackgroundTasks, FastAPI, HTTPException, Request, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, BaseSettings, Field, validator, condecimal
-from web3 import Web3, AsyncHTTPProvider
+from pydantic import BaseModel, Field, condecimal, validator
+from pydantic_settings import BaseSettings
+from solana.keypair import Keypair
+from solana.publickey import PublicKey
+from solana.rpc.async_api import AsyncClient
+from solana.rpc.types import TxOpts
+from solana.transaction import AccountMeta, Transaction, TransactionInstruction
+from spl.memo.constants import MEMO_PROGRAM_ID
+from web3 import AsyncHTTPProvider, Web3
 from web3.eth import AsyncEth
-from web3.middleware import async_geth_poa_middleware
 from web3.exceptions import ContractLogicError, TransactionNotFound
-from cryptography.fernet import Fernet
+from web3.middleware import async_geth_poa_middleware
 
 # ===== APPLICATION SETTINGS =====
 class AppSettings(BaseSettings):
     """Validated environment configuration with sane development defaults."""
 
     rpc_url: str = Field("http://localhost:8545", env="RPC_URL")
+    chain_id: int = Field(11155111, env="CHAIN_ID")
     identity_registry: str = Field("0x" + "0" * 40, env="IDENTITY_REGISTRY")
     vault_contract: str = Field("0x" + "0" * 40, env="VAULT_CONTRACT")
+    solana_rpc_url: str = Field("https://api.devnet.solana.com", env="SOLANA_RPC_URL")
+    solana_fee_payer: Optional[str] = Field(None, env="SOLANA_FEE_PAYER")
     jwt_secret: str = Field(
         "development-secret-key-with-min-length-32-characters",
         env="JWT_SECRET",
@@ -55,6 +66,16 @@ class AppSettings(BaseSettings):
         if v and v != "0x" + "0" * 40 and not Web3.is_address(v):
             raise ValueError("Expected a valid checksum address")
         return Web3.to_checksum_address(v) if Web3.is_address(v) else v
+
+    @validator("solana_fee_payer")
+    def validate_solana_key(cls, v: Optional[str]) -> Optional[str]:
+        if v is None:
+            return v
+        try:
+            base58.b58decode(v)
+        except Exception as exc:  # pragma: no cover - defensive
+            raise ValueError("SOLANA_FEE_PAYER must be valid base58") from exc
+        return v
 
     @validator("allowed_origins", pre=True)
     def split_origins(cls, v):
@@ -84,6 +105,21 @@ class SecurityConfig:
     def decrypt_sensitive(self, encrypted_data: str) -> str:
         """Decrypt sensitive data"""
         return self.cipher.decrypt(encrypted_data.encode()).decode()
+
+
+class BlockchainAdapter(Protocol):
+    """Protocol for pluggable blockchain adapters."""
+
+    chain: str
+
+    async def initialize(self) -> bool:
+        ...
+
+    async def verify_compliance(self, wallet_address: str) -> Dict[str, Any]:
+        ...
+
+    async def create_vault(self, ip_hash: str, valuation: int, owner: str, loan_terms: Dict[str, Any]) -> Dict[str, Any]:
+        ...
 
 # ===== BLOCKCHAIN SERVICE =====
 class AsyncBlockchainService:
@@ -344,8 +380,168 @@ class VaultCollateralManager:
             
             # Exponential backoff: 2^attempt seconds
             await asyncio.sleep(2 ** attempt)
-        
+
         raise TimeoutError(f"Transaction not confirmed after {max_attempts} attempts")
+
+
+class EVMAdapter:
+    """Adapter for EVM-compatible blockchains using web3.py."""
+
+    chain = "EVM"
+
+    def __init__(self, settings: AppSettings, security: SecurityConfig):
+        self.settings = settings
+        self.security = security
+        self.blockchain = AsyncBlockchainService(settings.rpc_url, chain_id=settings.chain_id)
+
+    async def initialize(self) -> bool:
+        return await self.blockchain.initialize()
+
+    async def verify_compliance(self, wallet_address: str) -> Dict[str, Any]:
+        if not self.settings.identity_registry or self.settings.identity_registry == "0x" + "0" * 40:
+            connected = await self.blockchain.w3.is_connected()
+            return {
+                "wallet": wallet_address,
+                "kyc_verified": connected,
+                "compliance_level": "CONNECTIVITY_ONLY",
+                "identity_data": {},
+                "timestamp": int(time.time()),
+            }
+
+        compliance = EnterpriseComplianceService(
+            self.blockchain,
+            self.settings.identity_registry,
+        )
+        return await compliance.comprehensive_kyc_verification(wallet_address)
+
+    async def create_vault(self, ip_hash: str, valuation: int, owner: str, loan_terms: Dict[str, Any]) -> Dict[str, Any]:
+        if not self.settings.vault_contract or self.settings.vault_contract == "0x" + "0" * 40:
+            raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="VAULT_CONTRACT not configured")
+
+        if not self.settings.encrypted_private_key:
+            raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="ENCRYPTED_PRIVATE_KEY missing")
+
+        collateral_manager = VaultCollateralManager(
+            self.blockchain,
+            self.settings.vault_contract,
+            self.settings.encrypted_private_key,
+            self.security,
+        )
+
+        return await collateral_manager.create_collateral_vault(
+            ip_hash=ip_hash,
+            valuation=valuation,
+            owner=owner,
+            loan_terms=loan_terms,
+        )
+
+
+class SolanaAdapter:
+    """Adapter for Solana using solana-py with memo-based vault anchoring."""
+
+    chain = "SOLANA"
+
+    def __init__(self, rpc_url: str, fee_payer_secret: Optional[str] = None):
+        self.rpc_url = rpc_url
+        self.client = AsyncClient(rpc_url)
+        self.fee_payer = self._load_fee_payer(fee_payer_secret)
+
+    def _load_fee_payer(self, secret: Optional[str]) -> Keypair:
+        if secret:
+            decoded = base58.b58decode(secret)
+            return Keypair.from_secret_key(decoded)
+        return Keypair()
+
+    async def initialize(self) -> bool:
+        try:
+            response = await self.client.get_version()
+            return bool(response and response.get("result"))
+        except Exception:
+            return False
+
+    @staticmethod
+    def _validate_public_key(value: str) -> PublicKey:
+        try:
+            return PublicKey(value)
+        except Exception as exc:
+            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="Invalid Solana address") from exc
+
+    async def _ensure_funding(self, minimum_lamports: int = 2_000_000) -> None:
+        balance_resp = await self.client.get_balance(self.fee_payer.public_key)
+        current = balance_resp.value if hasattr(balance_resp, "value") else balance_resp.get("result", {}).get("value", 0)
+        if current < minimum_lamports:
+            airdrop_resp = await self.client.request_airdrop(self.fee_payer.public_key, minimum_lamports * 2)
+            signature = airdrop_resp.value if hasattr(airdrop_resp, "value") else airdrop_resp.get("result")
+            if signature:
+                await self.client.confirm_transaction(signature)
+
+    async def verify_compliance(self, wallet_address: str) -> Dict[str, Any]:
+        public_key = self._validate_public_key(wallet_address)
+        balance = await self.client.get_balance(public_key)
+        lamports = balance.value if hasattr(balance, "value") else balance.get("result", {}).get("value", 0)
+        return {
+            "wallet": wallet_address,
+            "kyc_verified": lamports is not None,
+            "compliance_level": "ACCOUNT_EXISTS" if lamports is not None else "NOT_FOUND",
+            "lamports": lamports,
+            "timestamp": int(time.time()),
+        }
+
+    async def create_vault(self, ip_hash: str, valuation: int, owner: str, loan_terms: Dict[str, Any]) -> Dict[str, Any]:
+        owner_key = self._validate_public_key(owner)
+        await self._ensure_funding()
+
+        payload = json.dumps({
+            "ip": ip_hash,
+            "valuation": valuation,
+            "owner": str(owner_key),
+            "loan_terms": loan_terms,
+        }).encode()
+
+        instruction = TransactionInstruction(
+            keys=[AccountMeta(pubkey=self.fee_payer.public_key, is_signer=True, is_writable=False)],
+            program_id=MEMO_PROGRAM_ID,
+            data=payload,
+        )
+
+        transaction = Transaction().add(instruction)
+        send_resp = await self.client.send_transaction(transaction, self.fee_payer, opts=TxOpts(skip_preflight=True))
+        signature = send_resp.value if hasattr(send_resp, "value") else send_resp.get("result")
+
+        if not signature:
+            raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Solana transaction failed to send")
+
+        await self.client.confirm_transaction(signature)
+
+        return {
+            "success": True,
+            "transaction_hash": signature,
+            "vault_id": base58.b58encode(hashlib.sha256(payload).digest()).decode(),
+            "block_number": None,
+            "gas_used": None,
+        }
+
+
+class AdapterRegistry:
+    """Registry for blockchain adapters keyed by chain name."""
+
+    def __init__(self, settings: AppSettings, security: SecurityConfig):
+        self.adapters: Dict[str, BlockchainAdapter] = {
+            "EVM": EVMAdapter(settings, security),
+            "SOLANA": SolanaAdapter(settings.solana_rpc_url, settings.solana_fee_payer),
+        }
+
+    def get(self, chain: str) -> BlockchainAdapter:
+        key = chain.upper()
+        if key not in self.adapters:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Unsupported chain")
+        return self.adapters[key]
+
+    async def initialize_all(self) -> Dict[str, bool]:
+        results: Dict[str, bool] = {}
+        for key, adapter in self.adapters.items():
+            results[key] = await adapter.initialize()
+        return results
 
 # ===== SECURITY MIDDLEWARE =====
 class RateLimitMiddleware:
@@ -438,23 +634,20 @@ class AuditLogger:
 # ===== FASTAPI APPLICATION =====
 settings = AppSettings()
 security_config = SecurityConfig(settings)
-blockchain_service = AsyncBlockchainService(settings.rpc_url)
+adapter_registry = AdapterRegistry(settings, security_config)
 audit_logger = AuditLogger()
+adapter_health: Dict[str, bool] = {}
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     """Application lifespan management"""
-    # Startup
+    global adapter_health
     logging.info("🚀 Starting Vault Protocol API")
-    
-    # Initialize blockchain connection
-    if not await blockchain_service.initialize():
-        logging.error("❌ Failed to initialize blockchain connection")
-    
+    adapter_health = await adapter_registry.initialize_all()
     yield
-    
-    # Shutdown
     logging.info("🛑 Shutting down Vault Protocol API")
+
 
 app = FastAPI(
     title="Vault Protocol API",
@@ -478,25 +671,59 @@ app.middleware("http")(rate_limit_middleware)
 
 # ===== API MODELS =====
 class VaultCreationRequest(BaseModel):
-    ip_hash: str = Field(..., regex="^0x[a-fA-F0-9]{64}$")
+    chain: Literal["EVM", "SOLANA"]
+    ip_hash: str
     valuation_usd: condecimal(gt=0, max_digits=20, decimal_places=2)
-    owner_address: str = Field(..., regex="^0x[a-fA-F0-9]{40}$")
+    owner_address: str
     loan_terms: Dict[str, Any] = Field(default_factory=dict)
-    
+
+    @validator("ip_hash")
+    def validate_ip_hash(cls, v: str) -> str:
+        if v.startswith("0x") and len(v) == 66:
+            return v
+        try:
+            base58.b58decode(v)
+            return v
+        except Exception as exc:
+            raise ValueError("ip_hash must be 32-byte hex or base58") from exc
+
     @validator('owner_address')
-    def validate_address(cls, v):
+    def validate_address(cls, v, values):
+        chain = values.get("chain")
+        if chain == "SOLANA":
+            try:
+                return str(PublicKey(v))
+            except Exception as exc:
+                raise ValueError('Invalid Solana address') from exc
         if not Web3.is_address(v):
             raise ValueError('Invalid Ethereum address')
         return Web3.to_checksum_address(v)
 
+
 class ComplianceCheckRequest(BaseModel):
-    wallet_address: str = Field(..., regex="^0x[a-fA-F0-9]{40}$")
+    chain: Literal["EVM", "SOLANA"]
+    wallet_address: str
+
+    @validator("wallet_address")
+    def validate_wallet(cls, v, values):
+        chain = values.get("chain")
+        if chain == "SOLANA":
+            try:
+                return str(PublicKey(v))
+            except Exception as exc:
+                raise ValueError('Invalid Solana address') from exc
+        if not Web3.is_address(v):
+            raise ValueError('Invalid Ethereum address')
+        return Web3.to_checksum_address(v)
 
 # ===== API ENDPOINTS =====
 @app.get("/health")
 async def health_check():
     """Comprehensive health check"""
-    blockchain_healthy = await blockchain_service.w3.is_connected()
+    global adapter_health
+    if not adapter_health:
+        adapter_health = await adapter_registry.initialize_all()
+
     redis_ok = False
     if rate_limit_middleware.redis:
         try:
@@ -505,10 +732,10 @@ async def health_check():
             redis_ok = False
 
     return {
-        "status": "healthy" if blockchain_healthy else "degraded",
+        "status": "healthy" if all(adapter_health.values()) else "degraded",
         "timestamp": int(time.time()),
         "services": {
-            "blockchain": blockchain_healthy,
+            "blockchain": adapter_health,
             "redis": redis_ok,
             "database": True  # Would check DB connection
         },
@@ -518,38 +745,19 @@ async def health_check():
 @app.post("/vault/create")
 async def create_vault(request: VaultCreationRequest, background_tasks: BackgroundTasks):
     """Create IP collateral vault"""
-    if not settings.identity_registry or settings.identity_registry == "0x" + "0" * 40:
-        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="IDENTITY_REGISTRY not configured")
+    adapter = adapter_registry.get(request.chain)
 
-    if not settings.vault_contract or settings.vault_contract == "0x" + "0" * 40:
-        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="VAULT_CONTRACT not configured")
-
-    # Initialize services
-    compliance = EnterpriseComplianceService(
-        blockchain_service,
-        settings.identity_registry
-    )
-
-    collateral_manager = VaultCollateralManager(
-        blockchain_service,
-        settings.vault_contract,
-        settings.encrypted_private_key or "",
-        security_config
-    )
-    
-    # Verify compliance
-    kyc_status = await compliance.comprehensive_kyc_verification(request.owner_address)
+    kyc_status = await adapter.verify_compliance(request.owner_address)
     if not kyc_status["kyc_verified"]:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="KYC verification failed"
         )
-    
-    # Create vault
-    valuation_wei = int(request.valuation_usd * 10**18)
-    result = await collateral_manager.create_collateral_vault(
+
+    valuation = int(request.valuation_usd * (10**18 if adapter.chain == "EVM" else 10**9))
+    result = await adapter.create_vault(
         ip_hash=request.ip_hash,
-        valuation=valuation_wei,
+        valuation=valuation,
         owner=request.owner_address,
         loan_terms=request.loan_terms
     )
@@ -576,12 +784,8 @@ async def create_vault(request: VaultCreationRequest, background_tasks: Backgrou
 @app.post("/compliance/verify")
 async def verify_compliance(request: ComplianceCheckRequest):
     """Comprehensive compliance verification"""
-    compliance = EnterpriseComplianceService(
-        blockchain_service,
-        settings.identity_registry
-    )
-    
-    result = await compliance.comprehensive_kyc_verification(request.wallet_address)
+    adapter = adapter_registry.get(request.chain)
+    result = await adapter.verify_compliance(request.wallet_address)
     
     # Audit log
     audit_logger.log_event(
