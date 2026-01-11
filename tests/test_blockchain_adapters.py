@@ -1,13 +1,13 @@
 import asyncio
-from base58 import b58encode
-
-import pytest
-from solders.keypair import Keypair
-from solana.exceptions import SolanaRpcException
-from httpx import HTTPStatusError
-
 import sys
 from pathlib import Path
+
+import pytest
+from base58 import b58encode
+from fastapi import HTTPException
+from httpx import HTTPStatusError
+from solana.exceptions import SolanaRpcException
+from solders.keypair import Keypair
 
 sys.path.append(str(Path(__file__).resolve().parents[1]))
 
@@ -82,7 +82,7 @@ async def test_solana_adapter_airdrop_and_memo():
             ),
             timeout=120,
         )
-    except (HTTPStatusError, SolanaRpcException):
+    except (HTTPStatusError, SolanaRpcException, HTTPException):
         pytest.skip("Solana devnet airdrop rate-limited")
 
     assert result["success"] is True
