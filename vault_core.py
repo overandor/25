@@ -20,7 +20,7 @@ from fastapi import FastAPI, HTTPException, BackgroundTasks, Request, status, Up
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, ValidationInfo, condecimal, field_validator
-from pydantic_settings import BaseSettings
+from pydantic_settings import BaseSettings, SettingsConfigDict
 from web3 import Web3, AsyncHTTPProvider
 from web3.eth import AsyncEth
 from web3.middleware import async_geth_poa_middleware
@@ -58,6 +58,8 @@ def decode_base58_private_key(value: str) -> Keypair:
 class AppSettings(BaseSettings):
     """Validated environment configuration with sane development defaults."""
 
+    model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8")
+
     rpc_url: str = Field("http://localhost:8545", env="RPC_URL")
     evm_chain_id: int = Field(11155111, env="EVM_CHAIN_ID")
     solana_rpc_url: str = Field("https://api.devnet.solana.com", env="SOLANA_RPC_URL")
@@ -75,10 +77,6 @@ class AppSettings(BaseSettings):
     default_chain: str = Field("evm", env="DEFAULT_CHAIN")
     redis_url: str = Field("redis://localhost:6379", env="REDIS_URL")
     allowed_origins: List[str] = Field(default_factory=list, env="ALLOWED_ORIGINS")
-
-    class Config:
-        env_file = ".env"
-        env_file_encoding = "utf-8"
 
     @field_validator("jwt_secret")
     @classmethod
