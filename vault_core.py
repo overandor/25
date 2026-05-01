@@ -5,16 +5,32 @@ Enterprise-grade IP collateralization with ERC-3643 compliance
 """
 
 import asyncio
+import hashlib
 import json
 import logging
 import os
 import time
 from contextlib import asynccontextmanager
+from typing import Any, AsyncGenerator, Dict, List, Literal, Optional, Protocol
 from typing import Any, AsyncGenerator, Dict, List, Optional, Protocol
 import hashlib
 from pathlib import Path
 
+import base58
 import redis.asyncio as redis
+from cryptography.fernet import Fernet
+from fastapi import BackgroundTasks, FastAPI, HTTPException, Request, status
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel, Field, condecimal, validator
+from pydantic_settings import BaseSettings
+from solana.keypair import Keypair
+from solana.publickey import PublicKey
+from solana.rpc.async_api import AsyncClient
+from solana.rpc.types import TxOpts
+from solana.transaction import AccountMeta, Transaction, TransactionInstruction
+from spl.memo.constants import MEMO_PROGRAM_ID
+from web3 import AsyncHTTPProvider, Web3
 from base58 import b58decode, b58encode
 from fastapi import FastAPI, HTTPException, BackgroundTasks, Request, status, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
@@ -23,8 +39,8 @@ from pydantic import BaseModel, Field, ValidationInfo, condecimal, field_validat
 from pydantic_settings import BaseSettings
 from web3 import Web3, AsyncHTTPProvider
 from web3.eth import AsyncEth
-from web3.middleware import async_geth_poa_middleware
 from web3.exceptions import ContractLogicError, TransactionNotFound
+from web3.middleware import async_geth_poa_middleware
 from cryptography.fernet import Fernet
 from solders.keypair import Keypair
 from solders.pubkey import Pubkey
@@ -59,6 +75,11 @@ class AppSettings(BaseSettings):
     """Validated environment configuration with sane development defaults."""
 
     rpc_url: str = Field("http://localhost:8545", env="RPC_URL")
+    chain_id: int = Field(11155111, env="CHAIN_ID")
+    identity_registry: str = Field("0x" + "0" * 40, env="IDENTITY_REGISTRY")
+    vault_contract: str = Field("0x" + "0" * 40, env="VAULT_CONTRACT")
+    solana_rpc_url: str = Field("https://api.devnet.solana.com", env="SOLANA_RPC_URL")
+    solana_fee_payer: Optional[str] = Field(None, env="SOLANA_FEE_PAYER")
     evm_chain_id: int = Field(11155111, env="EVM_CHAIN_ID")
     solana_rpc_url: str = Field("https://api.devnet.solana.com", env="SOLANA_RPC_URL")
     identity_registry: str = Field("0x" + "0" * 40, env="IDENTITY_REGISTRY")
@@ -698,11 +719,13 @@ adapter_registry.register(
     )
 )
 audit_logger = AuditLogger()
+adapter_health: Dict[str, bool] = {}
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     """Application lifespan management"""
-    # Startup
+    global adapter_health
     logging.info("🚀 Starting Vault Protocol API")
 
     # Initialize blockchain connections
@@ -714,9 +737,8 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
             logging.error("❌ %s adapter failed to initialize", chain)
     
     yield
-    
-    # Shutdown
     logging.info("🛑 Shutting down Vault Protocol API")
+
 
 app = FastAPI(
     title="Vault Protocol API",
@@ -777,6 +799,7 @@ class VaultCreationRequest(BaseModel):
         if chain == "solana":
             return validate_base58_public_key(v)
         raise ValueError("Unsupported chain")
+
 
 class ComplianceCheckRequest(BaseModel):
     chain: str = Field(default=settings.default_chain)
