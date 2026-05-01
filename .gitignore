@@ -1,8 +1,14 @@
+# Dependencies
+node_modules/
+
+# Python caches
 __pycache__/
-*.pyc
+*.py[cod]
+*.pyo
+
+# Environment and local config
 .env
 .venv/
-node_modules/
-.data/
-data/
-.DS_Store
+
+# Artifacts
+artifacts/
