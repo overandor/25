@@ -63,6 +63,15 @@ GET /health
 
 Returns system status and service health.
 
+Artifact Upload
+
+```http
+POST /vault/upload
+Content-Type: multipart/form-data (file field)
+```
+
+Returns a deterministic `ip_hash` after enforcing MIME/type and size limits (10 MB). Accepted MIME types: PDF, ZIP, JSON, PNG, JPEG, plain text. Artifacts are stored under `artifacts/` and renamed with the computed hash prefix for traceability.
+
 Create Vault
 
 ```http
@@ -180,5 +189,9 @@ Proprietary - All rights reserved.
 7. **🔐 Key Security**: Encrypted private key storage
 8. **🚦 Rate Limiting**: Redis-based with proper middleware
 9. **📝 Audit Trail**: Cryptographic chain of custody for all operations
+
+### Front-End Utility
+
+`apps/app-artifact-uploader/index.html` provides a thin uploader UI that posts to `/vault/upload` then submits vault creation to `/vault/create` with the returned `ip_hash`. Serve it locally with `python -m http.server` for quick manual flows.
 
 This implementation is ready for enterprise deployment with no mocks and full production hardening.
